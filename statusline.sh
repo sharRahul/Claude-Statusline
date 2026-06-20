@@ -177,14 +177,68 @@ if [[ -f "$STATUS_CACHE" ]]; then
 fi
 
 # ---- Claude.ai usage cache (background refresh if stale, file-locked) -------
+# Built-in OAuth fallback used when refresh_usage.sh is absent.
+_oauth_refresh_usage() {
+    local creds="$HOME/.claude/.credentials.json"
+    [[ ! -f "$creds" ]] && return 1
+    local token
+    token="$(jq -r '
+        .claudeAiOauth.accessToken //
+        .claudeAiOauthTokens.accessToken //
+        .accessToken //
+        empty' "$creds" 2>/dev/null)"
+    [[ -z "$token" ]] && return 1
+
+    local resp
+    resp="$(curl -sf --max-time 10 \
+        -H "Authorization: Bearer $token" \
+        -H "Content-Type: application/json" \
+        "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)"
+    [[ -z "$resp" ]] && return 1
+
+    # Normalize to our cache format; handle multiple possible response shapes.
+    local parsed
+    parsed="$(printf '%s' "$resp" | jq '
+        def util:
+            .utilization // .percentage_used // .percent_used //
+            (if (.used_dollars != null and .limit_dollars != null and .limit_dollars > 0)
+             then (.used_dollars / .limit_dollars * 100) else null end) //
+            (if (.count != null and .limit != null and .limit > 0)
+             then (.count / .limit * 100) else null end) // null;
+        def rst:
+            .resets_at // .reset_at // .reset_time // .resetsAt // null;
+        def extract(node): node | { utilization: util, resets_at: rst };
+        {
+            five_hour: extract(
+                .five_hour // .fiveHour // .rate_limits.five_hour // {}
+            ),
+            seven_day: extract(
+                .seven_day // .sevenDay //
+                .rate_limits.seven_day // .rate_limits.week // {}
+            )
+        }' 2>/dev/null)"
+
+    # Only persist if we received a meaningful reset time for at least one window.
+    printf '%s' "$parsed" | jq -e '
+        (.five_hour.resets_at  != null and .five_hour.resets_at  != "") or
+        (.seven_day.resets_at != null and .seven_day.resets_at != "")
+    ' >/dev/null 2>&1 || return 1
+
+    printf '%s\n' "$parsed" > "$CACHE_FILE"
+}
+
 cache_age=999999
 if [[ -f "$CACHE_FILE" ]]; then
     _cmtime=$(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0)
     cache_age=$(( now_ts - _cmtime ))
 fi
-if (( cache_age > 300 )) && [[ -f "$REFRESH_SCRIPT" ]]; then
+if (( cache_age > 300 )); then
     if mkdir "$CACHE_LOCK" 2>/dev/null; then
-        ( bash "$REFRESH_SCRIPT" >/dev/null 2>&1; rmdir "$CACHE_LOCK" 2>/dev/null ) &
+        if [[ -f "$REFRESH_SCRIPT" ]]; then
+            ( bash "$REFRESH_SCRIPT" >/dev/null 2>&1; rmdir "$CACHE_LOCK" 2>/dev/null ) &
+        else
+            ( _oauth_refresh_usage; rmdir "$CACHE_LOCK" 2>/dev/null ) &
+        fi
     fi
 fi
 

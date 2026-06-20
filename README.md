@@ -97,11 +97,14 @@ Required for git branch, dirty-state, and ahead/behind detection. Usually pre-in
 
 On Windows, Claude Code's `statusLine` command runs via **Git Bash** (the `sh` that ships with [Git for Windows](https://git-scm.com/download/win)). All POSIX tools the script needs (`awk`, `date`, `stat`, `basename`, `git`) are included in Git Bash.
 
-### 5. refresh_usage.sh (for 5h/7d data)
+### 5. refresh_usage.sh (optional — 5h/7d data)
 
-The 5h and 7d utilization fields are read from `~/.claude/usage_cache.json`. This file is populated and refreshed by a companion script at `~/.claude/refresh_usage.sh`. Without it, the 5h and 7d segments will display `-`.
+The 5h and 7d utilization fields are read from `~/.claude/usage_cache.json`. The script refreshes this cache automatically via one of two paths — no manual setup is required for either:
 
-Place your `refresh_usage.sh` at `~/.claude/refresh_usage.sh` and make it executable (`chmod +x`). The status line script calls it automatically in the background when the cache is older than 5 minutes.
+- **If `~/.claude/refresh_usage.sh` exists** — the script calls it in the background when the cache is older than 5 minutes. Use this path if you have a custom refresh script (e.g. one that uses a Claude.ai session cookie).
+- **If `refresh_usage.sh` is absent** — the script falls back to reading the OAuth access token that Claude Code stores automatically in `~/.claude/.credentials.json` and calls `https://api.anthropic.com/api/oauth/usage` directly. This works out of the box with no extra configuration as long as you are logged in to Claude Code.
+
+If neither path produces data the 5h and 7d segments display `-`.
 
 ---
 
@@ -216,7 +219,7 @@ The `model` field may also be an object with a `display_name`, `name`, or `id` k
 Install jq (see Prerequisites). On Windows, confirm the `statusLine` command starts with `sh` (Git Bash), not `powershell`.
 
 **5h / 7d always show `-`**
-The usage data comes from `~/.claude/usage_cache.json`. Either the file doesn't exist yet, or `refresh_usage.sh` is missing at `~/.claude/refresh_usage.sh`. Ensure that script is present and executable.
+The usage data comes from `~/.claude/usage_cache.json`. The script refreshes it automatically — first via `~/.claude/refresh_usage.sh` if present, otherwise via the OAuth token in `~/.claude/.credentials.json`. If both are absent the segments stay at `-`. Confirm you are logged in to Claude Code (`claude auth status`) so the credentials file exists.
 
 **Context bar always shows 0%**
 The script reads token counts from the transcript file at `transcript_path`. Verify that `transcript_path` is present in the stdin payload (`echo '{}' | sh statusline.sh` uses an empty payload and will show 0%). After sending at least one message the real payload will contain the path.
