@@ -1,9 +1,9 @@
 # Claude Code Status Line
 
-A shell script that adds a live status bar to [Claude Code](https://claude.ai/code), showing your active model, effort level, context window usage, Claude.ai rolling usage percentages, session duration, current folder, and git branch — updated automatically after every message.
+A shell script that adds a live status bar to [Claude Code](https://claude.ai/code), showing your active model, session cost, context window usage, Claude.ai rolling usage percentages, session duration, current folder, git branch with sync status, and Claude infrastructure health — updated automatically after every message.
 
 ```
-Sonnet 4.6 [Low] | ████░░░░░░ 37% 74K/200K | 5h:12% ↺ 2h 14m | 7d:45% ↺ 3d 6h | 1h 23m | my-project (main*)
+Sonnet 4.6 [Low] | $0.042 | ████░░░░░░ 37% 74K/200K | 5h:12% ↺ 2h 14m | 7d:45% ↺ 3d 6h | 1h 23m | my-project (main* ↑2↓1)
 ```
 
 ---
@@ -14,16 +14,20 @@ Claude Code has a built-in `statusLine` hook. When enabled, Claude Code **automa
 
 The script reads that payload and:
 
-1. Parses the transcript file at `transcript_path` to count used tokens and compute session duration.
+1. Parses the transcript file at `transcript_path` to count used tokens, compute session cost, and derive session duration.
 2. Reads `~/.claude/usage_cache.json` for your Claude.ai 5-hour and 7-day utilization percentages.
 3. Triggers a background refresh of that cache (via `~/.claude/refresh_usage.sh`) if it is older than 5 minutes.
-4. Detects the git branch of the current working directory and whether the tree is dirty.
+4. Detects the git branch, dirty state, and ahead/behind remote sync count of the current working directory.
+5. Polls `status.claude.com` every 10 minutes for Claude infrastructure health, only showing an indicator when there is an active incident.
+
+Background refreshes are file-locked so only one process runs at a time, even when multiple terminal windows are open.
 
 ```
 Claude Code  ──(session JSON on stdin)──────────────>  statusline.sh
-transcript file  ──(token counts, timestamps)───────>  statusline.sh
+transcript file  ──(tokens, timestamps)─────────────>  statusline.sh
 ~/.claude/usage_cache.json  ──(5h/7d utilization)──>  statusline.sh
-git repo  ──(branch, dirty state)──────────────────>  statusline.sh
+git repo  ──(branch, dirty, ahead/behind)──────────>  statusline.sh
+status.claude.com  ──(infrastructure health)────────>  statusline.sh
                                                              │
                                           formatted string  ▼
                                                       status bar
@@ -37,6 +41,7 @@ git repo  ──(branch, dirty state)──────────────�
 |---|---|---|
 | **Model** | `Sonnet 4.6` | Active model, color-coded (purple = Opus, blue = Sonnet, green = Haiku) |
 | **Effort** | `[Low]` | Effort level from the session payload or `~/.claude/settings.json`; omitted if not set |
+| **Session cost** | `$0.042` | Cumulative cost of the current session in USD, computed from transcript token counts and model pricing; omitted when zero |
 | **Context bar** | `████░░░░░░` | Visual fill of context window consumed; color turns bright yellow ≥40%, yellow ≥60%, red ≥80% |
 | **Context %** | `37%` | Percentage of context window used |
 | **Used / Limit** | `74K/200K` | Tokens consumed and total window size (switches to `1M` if `exceeds_200k` is set) |
@@ -47,6 +52,8 @@ git repo  ──(branch, dirty state)──────────────�
 | **Session duration** | `1h 23m` | How long the current session has been running, derived from the first transcript timestamp |
 | **Folder** | `my-project` | Basename of the current working directory |
 | **Git branch** | `(main*)` | Current git branch; `*` suffix means uncommitted changes exist; omitted if not in a git repo |
+| **Ahead/behind** | `↑2↓1` | Commits ahead (green ↑) or behind (red ↓) the remote tracking branch; omitted when in sync or no upstream |
+| **Claude status** | `⚠` / `✗` | Infrastructure incident indicator from status.claude.com; only shown when there is an active incident |
 
 ### Color coding
 
@@ -59,7 +66,7 @@ Utilization segments (context bar, 5h, 7d) are colored based on percentage:
 | 60–79% | Yellow |
 | ≥ 80% | Red |
 
-Git branch is shown in cyan when clean, bright yellow when dirty (`*`).
+Git branch is shown in cyan when clean, bright yellow when dirty (`*`). Ahead commits are green, behind commits are red. The Claude status indicator is yellow for minor incidents, red for major/critical.
 
 ---
 
@@ -84,7 +91,7 @@ Required by `refresh_usage.sh` to fetch your Claude.ai usage data. Usually pre-i
 
 ### 3. git
 
-Required for git branch and dirty-state detection. Usually pre-installed everywhere. On Windows, Git Bash includes it automatically.
+Required for git branch, dirty-state, and ahead/behind detection. Usually pre-installed everywhere. On Windows, Git Bash includes it automatically.
 
 ### 4. Shell (Windows only)
 
@@ -225,6 +232,18 @@ macOS ships with BSD `date`, which does not support the `-d` flag. Install GNU c
 
 **Effort level not showing**
 Effort is read from the session payload's `.effort.level` field, or falls back to `.effortLevel` in `~/.claude/settings.json`. If neither is set, the effort label is omitted.
+
+**Session cost shows `$0.000` or nothing**
+Cost is computed from each API call's token usage in the transcript file. If the transcript has no usage data yet (e.g. the very first turn), the cost segment is hidden. Cost uses approximate per-model pricing: Opus $15/$75, Sonnet $3/$15, Haiku $0.80/$4 per million input/output tokens.
+
+**Ahead/behind not showing**
+The `↑`/`↓` counts require a remote tracking branch (`git branch --set-upstream-to=origin/main main`). If the current branch has no upstream configured, the sync indicators are omitted — this is expected.
+
+**Claude status indicator not appearing**
+The indicator is only shown during an active incident — silence means all systems operational. The status is cached in `~/.claude/claude_status_cache.json` and refreshed every 10 minutes via a background `curl` call. If curl is unavailable or the endpoint is unreachable, the indicator is simply omitted.
+
+**Colors appearing in output that doesn't support them**
+Set the `NO_COLOR` environment variable before running Claude Code and the script will strip all ANSI color codes from its output.
 
 ---
 
