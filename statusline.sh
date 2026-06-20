@@ -2,12 +2,12 @@
 
 # Claude Code Status Line
 # Format:
-#   Model [Effort] | [bar] ctx% usedK/200K | 5h:X% ↺Xh Xm | 7d:X% | session | clock | folder
+#   Model [Effort] | [bar] ctx% usedK/200K | 5h:X% ↺Xh Xm | 7d:X% ↺Xh Xm | duration | folder (branch*)
 #
 # Reads the JSON Claude Code passes on stdin for context usage.
 # Reads ~/.claude/usage_cache.json for Claude.ai 5h/7d usage limits.
 # Triggers background refresh of the cache if it is older than 5 minutes.
-# Requires: jq, curl.
+# Requires: jq, curl, git.
 
 CACHE_FILE="$HOME/.claude/usage_cache.json"
 REFRESH_SCRIPT="$HOME/.claude/refresh_usage.sh"
@@ -17,6 +17,8 @@ input="$(cat 2>/dev/null)"
 [[ -z "$input" ]] && input="{}"
 
 jqr() { echo "$input" | jq -r "$1" 2>/dev/null; }
+
+now_ts=$(date +%s)
 
 # ---- model name --------------------------------------------------------------
 _model_type="$(echo "$input" | jq -r '.model | type' 2>/dev/null)"
@@ -42,7 +44,6 @@ case "$model_name" in
     haiku)  model_name="Claude Haiku" ;;
 esac
 
-session_id="$(jqr '.session_id // empty')"
 transcript_path="$(jqr '.transcript_path // empty')"
 current_dir="$(jqr '.cwd // .workspace.current_dir // empty')"
 exceeds_200k="$(jqr '.exceeds_200k_tokens // false')"
@@ -92,8 +93,36 @@ fi
 ctx_pct=$(( used_tokens * 100 / context_limit ))
 used_label="$(fmt_tokens "$used_tokens")"
 
+# ---- session duration from transcript timestamps ----------------------------
+session_duration="-"
+if [[ -n "$transcript_path" && -f "$transcript_path" ]]; then
+    first_ts="$(jq -r '[.[] | select(.timestamp != null) | .timestamp] | first // empty' "$transcript_path" 2>/dev/null)"
+    if [[ -n "$first_ts" ]]; then
+        start_epoch=$(date -d "$first_ts" +%s 2>/dev/null)
+        if [[ -n "$start_epoch" && "$start_epoch" -gt 0 ]]; then
+            elapsed=$(( now_ts - start_epoch ))
+            h=$(( elapsed / 3600 ))
+            m=$(( (elapsed % 3600) / 60 ))
+            if (( h > 0 )); then
+                session_duration="${h}h ${m}m"
+            else
+                session_duration="${m}m"
+            fi
+        fi
+    fi
+fi
+
+# ---- git branch + dirty state -----------------------------------------------
+git_branch=""
+if [[ -n "$current_dir" ]]; then
+    git_branch="$(git -C "$current_dir" symbolic-ref --short HEAD 2>/dev/null)"
+    if [[ -n "$git_branch" ]]; then
+        git_dirty="$(git -C "$current_dir" status --porcelain 2>/dev/null)"
+        [[ -n "$git_dirty" ]] && git_branch="${git_branch}*"
+    fi
+fi
+
 # ---- Claude.ai usage cache (background refresh if stale) --------------------
-now_ts=$(date +%s)
 cache_age=999999
 if [[ -f "$CACHE_FILE" ]]; then
     cache_mtime=$(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0)
@@ -109,15 +138,16 @@ weekly_pct="-"
 session_reset_label=""
 weekly_reset_label=""
 
-pct_color() {  # returns ANSI color code based on utilization number
+pct_color() {
     local p="${1%.*}"
     if   (( p >= 80 )); then echo "31"   # red
     elif (( p >= 60 )); then echo "33"   # yellow
+    elif (( p >= 40 )); then echo "93"   # bright yellow
     else                     echo "32"   # green
     fi
 }
 
-countdown() {  # ISO 8601 timestamp -> "Xd Yh", "Xh Ym", or "Xm" countdown string
+countdown() {
     local ts
     ts=$(date -d "$1" +%s 2>/dev/null) || return
     local secs=$(( ts - now_ts ))
@@ -157,6 +187,7 @@ empty=$(( bar_width - filled ))
 
 if   (( ctx_pct >= 80 )); then bar_color="31"
 elif (( ctx_pct >= 60 )); then bar_color="33"
+elif (( ctx_pct >= 40 )); then bar_color="93"
 else                           bar_color="32"
 fi
 
@@ -165,8 +196,6 @@ for (( i = 0; i < filled; i++ )); do bar="${bar}█"; done
 for (( i = 0; i < empty;  i++ )); do bar="${bar}░"; done
 
 # ---- other segments ----------------------------------------------------------
-session_short="${session_id:0:8}"
-[[ -z "$session_short" ]] && session_short="-"
 folder="$(basename "$current_dir")"
 
 # ---- model color -------------------------------------------------------------
@@ -202,10 +231,21 @@ else
     weekly_seg="\033[90m7d:-\033[0m"
 fi
 
-printf "\033[1;%sm%s\033[0m $SEP %b $SEP %b $SEP %b $SEP \033[90m%s\033[0m $SEP \033[34m%s\033[0m\n" \
+# Folder + git branch segment
+folder_seg="\033[34m${folder}\033[0m"
+if [[ -n "$git_branch" ]]; then
+    branch_display="${git_branch%\*}"
+    if [[ "$git_branch" == *\* ]]; then
+        folder_seg="${folder_seg} \033[90m(\033[0m\033[93m${branch_display}*\033[0m\033[90m)\033[0m"
+    else
+        folder_seg="${folder_seg} \033[90m(\033[0m\033[36m${git_branch}\033[0m\033[90m)\033[0m"
+    fi
+fi
+
+printf "\033[1;%sm%s\033[0m $SEP %b $SEP %b $SEP %b $SEP \033[90m%s\033[0m $SEP %b\n" \
     "$model_color" "$model_segment" \
     "$ctx_seg" \
     "$fiveh_seg" \
     "$weekly_seg" \
-    "$session_short" \
-    "$folder"
+    "$session_duration" \
+    "$folder_seg"
