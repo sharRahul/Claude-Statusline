@@ -240,7 +240,7 @@ fi
 if (( cache_age > 300 )); then
     if mkdir "$CACHE_LOCK" 2>/dev/null; then
         if [[ -f "$REFRESH_SCRIPT" ]]; then
-            ( bash "$REFRESH_SCRIPT" >/dev/null 2>&1; rmdir "$CACHE_LOCK" 2>/dev/null ) &
+            ( bash "$REFRESH_SCRIPT" >/dev/null 2>&1 || _oauth_refresh_usage; rmdir "$CACHE_LOCK" 2>/dev/null ) &
         else
             ( _oauth_refresh_usage; rmdir "$CACHE_LOCK" 2>/dev/null ) &
         fi
