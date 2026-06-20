@@ -123,6 +123,11 @@ if [[ -n "$transcript_path" && -f "$transcript_path" ]]; then
 fi
 
 # ---- session duration from transcript timestamps ----------------------------
+# Reads the first .timestamp field written by Claude Code into the transcript
+# JSONL file. Claude Code creates and populates this file automatically after
+# the first API call, so duration shows "-" on the very first turn and updates
+# from the second message onwards. Falls back to "-" if the transcript is
+# missing or contains no timestamps.
 session_duration="-"
 if [[ -n "$transcript_path" && -f "$transcript_path" ]]; then
     first_ts="$(jq -r '[.[] | select(.timestamp != null) | .timestamp] | first // empty' "$transcript_path" 2>/dev/null)"
