@@ -166,11 +166,13 @@ if [[ -f "$STATUS_CACHE" ]]; then
     status_age=$(( now_ts - _smtime ))
 fi
 if (( status_age > 600 )); then
-    _slmtime=$(stat -c %Y "$STATUS_LOCK" 2>/dev/null || echo 0)
-    (( now_ts - _slmtime > 60 )) && rmdir "$STATUS_LOCK" 2>/dev/null
-    if mkdir "$STATUS_LOCK" 2>/dev/null; then
+    if command -v flock >/dev/null 2>&1; then
+        ( flock -n 9 || exit 0
+          curl -sf --max-time 3 "https://status.claude.com/api/v2/status.json" \
+              > "$STATUS_CACHE" 2>/dev/null ) 9>"$STATUS_LOCK" &
+    else
         ( curl -sf --max-time 3 "https://status.claude.com/api/v2/status.json" \
-            > "$STATUS_CACHE" 2>/dev/null; rmdir "$STATUS_LOCK" 2>/dev/null ) &
+              > "$STATUS_CACHE" 2>/dev/null ) &
     fi
 fi
 
@@ -240,13 +242,18 @@ if [[ -f "$CACHE_FILE" ]]; then
     cache_age=$(( now_ts - _cmtime ))
 fi
 if (( cache_age > 300 )); then
-    _clmtime=$(stat -c %Y "$CACHE_LOCK" 2>/dev/null || echo 0)
-    (( now_ts - _clmtime > 60 )) && rmdir "$CACHE_LOCK" 2>/dev/null
-    if mkdir "$CACHE_LOCK" 2>/dev/null; then
+    if command -v flock >/dev/null 2>&1; then
+        ( flock -n 9 || exit 0
+          if [[ -f "$REFRESH_SCRIPT" ]]; then
+              bash "$REFRESH_SCRIPT" >/dev/null 2>&1 || _oauth_refresh_usage
+          else
+              _oauth_refresh_usage
+          fi ) 9>"$CACHE_LOCK" &
+    else
         if [[ -f "$REFRESH_SCRIPT" ]]; then
-            ( bash "$REFRESH_SCRIPT" >/dev/null 2>&1 || _oauth_refresh_usage; rmdir "$CACHE_LOCK" 2>/dev/null ) &
+            ( bash "$REFRESH_SCRIPT" >/dev/null 2>&1 || _oauth_refresh_usage ) &
         else
-            ( _oauth_refresh_usage; rmdir "$CACHE_LOCK" 2>/dev/null ) &
+            ( _oauth_refresh_usage ) &
         fi
     fi
 fi
