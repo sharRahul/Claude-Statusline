@@ -101,10 +101,12 @@ On Windows, Claude Code's `statusLine` command runs via **Git Bash** (the `sh` t
 
 The 5h and 7d utilization fields are read from `~/.claude/usage_cache.json`. The script refreshes this cache automatically via one of two paths — no manual setup is required for either:
 
-- **If `~/.claude/refresh_usage.sh` exists** — the script calls it in the background when the cache is older than 5 minutes. Use this path if you have a custom refresh script (e.g. one that uses a Claude.ai session cookie).
-- **If `refresh_usage.sh` is absent** — the script falls back to reading the OAuth access token that Claude Code stores automatically in `~/.claude/.credentials.json` and calls `https://api.anthropic.com/api/oauth/usage` directly. This works out of the box with no extra configuration as long as you are logged in to Claude Code.
+- **If `~/.claude/refresh_usage.sh` exists** — the script calls it in the background when the cache is older than 5 minutes. Use this path if you have a custom refresh script (e.g. one that uses a Claude.ai session cookie). If the refresh script exits non-zero (e.g. because a session key has expired or the API returned bad data), the script automatically falls back to the OAuth path below.
+- **If `refresh_usage.sh` is absent, or if it fails** — the script reads the OAuth access token that Claude Code stores automatically in `~/.claude/.credentials.json` and calls `https://api.anthropic.com/api/oauth/usage` directly. This works out of the box with no extra configuration as long as you are logged in to Claude Code.
 
 If neither path produces data the 5h and 7d segments display `-`.
+
+> **Note for `refresh_usage.sh` authors:** your script must exit with a non-zero status when the API call fails or returns unexpected data — otherwise the OAuth fallback cannot trigger. A simple pattern is to `exit 1` in the failure branch after deleting any temporary file.
 
 ---
 
