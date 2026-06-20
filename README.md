@@ -20,7 +20,7 @@ The script reads that payload and:
 4. Detects the git branch, dirty state, and ahead/behind remote sync count of the current working directory.
 5. Polls `status.claude.com` every 10 minutes for Claude infrastructure health, only showing an indicator when there is an active incident.
 
-Background refreshes are file-locked so only one process runs at a time, even when multiple terminal windows are open.
+Background refreshes use `flock` (Linux/macOS) so only one process runs at a time even when multiple terminal windows are open — the OS releases the lock automatically if the process dies, so it can never get stuck. On Windows/Git Bash where `flock` is unavailable the refresh runs without locking; parallel writes to the small JSON cache are harmless.
 
 ```
 Claude Code  ──(session JSON on stdin)──────────────>  statusline.sh
