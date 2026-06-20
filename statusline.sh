@@ -1,259 +1,211 @@
-#!/bin/sh
-# =============================================================================
+#!/bin/bash
+
 # Claude Code Status Line
-# =============================================================================
-# Hooks into Claude Code's built-in statusLine feature.
+# Format:
+#   Model [Effort] | [bar] ctx% usedK/200K | 5h:X% ↺Xh Xm | 7d:X% | session | clock | folder
 #
-# HOW IT WORKS
-#   Claude Code authenticates with the Anthropic API using your ANTHROPIC_API_KEY.
-#   After every API call, Claude Code automatically pipes a JSON payload to this
-#   script's stdin containing the current model, token counts, context window
-#   size, and the path to the session transcript file.
-#   This script parses that payload and reads your local Claude Code transcript
-#   files to compute usage windows and workspace — no additional API or network
-#   calls are made.
-#
-#   Data flow:  Claude Code  ──(session JSON on stdin)──>  statusline.sh
-#               ~/.claude/projects/**/*.jsonl  ──(window counts)──>  statusline.sh
-#                                                               │
-#                                              formatted string ▼
-#                                                          status bar
-#
-#   Never put your API key inside this script or commit it to a repository.
-#
-# OUTPUT EXAMPLE
-#   Claude Sonnet 4.6  [████████░░░░░░░░░░░░░░░░] 33%/200k  5h:12  7d:45  ~$0.12  14m22s  GitHub
-#
-# FIELDS
-#   Model       — active model name from the API payload
-#   Context     — progress bar of context window used + percentage + total size
-#   5h          — number of prompts you have sent across all projects in the
-#                 last 5 hours (mirrors Claude Pro's rolling usage window)
-#   7d          — same count over the last 7 days
-#   Cost        — estimated API cost for the current session (input + output tokens)
-#   Duration    — time elapsed since the first message in this session
-#   Workspace   — basename of the working directory when this session was started
-#
-# SETUP
-#   1. Set your Anthropic API key in your shell environment:
-#        export ANTHROPIC_API_KEY="sk-ant-..."
-#
-#   2. Add the statusLine block to your Claude Code settings.json:
-#        "statusLine": {
-#          "type": "command",
-#          "command": "sh /path/to/statusline.sh"
-#        }
-#
-#   3. Restart Claude Code — the status bar appears after the first response.
-# =============================================================================
+# Reads the JSON Claude Code passes on stdin for context usage.
+# Reads ~/.claude/usage_cache.json for Claude.ai 5h/7d usage limits.
+# Triggers background refresh of the cache if it is older than 5 minutes.
+# Requires: jq, curl.
 
-# ---------------------------------------------------------------------------
-# Locate jq — tries PATH first, then common install locations
-# ---------------------------------------------------------------------------
-_find_jq() {
-  command -v jq >/dev/null 2>&1 && echo "jq" && return
+CACHE_FILE="$HOME/.claude/usage_cache.json"
+REFRESH_SCRIPT="$HOME/.claude/refresh_usage.sh"
 
-  # Linux / macOS
-  for p in /usr/bin/jq /usr/local/bin/jq /opt/homebrew/bin/jq; do
-    [ -x "$p" ] && echo "$p" && return
-  done
+# ---- read stdin JSON ---------------------------------------------------------
+input="$(cat 2>/dev/null)"
+[[ -z "$input" ]] && input="{}"
 
-  # Windows — WinGet (Git Bash)
-  if [ -n "$USERNAME" ]; then
-    winget_base="/c/Users/$USERNAME/AppData/Local/Microsoft/WinGet/Packages"
-    jq_win=$(find "$winget_base" -name "jq.exe" 2>/dev/null | head -1)
-    [ -n "$jq_win" ] && echo "$jq_win" && return
-  fi
+jqr() { echo "$input" | jq -r "$1" 2>/dev/null; }
 
-  # Windows — Scoop (Git Bash)
-  if [ -n "$USERPROFILE" ]; then
-    scoop_jq=$(cygpath -u "$USERPROFILE" 2>/dev/null)/scoop/apps/jq/current/jq.exe
-    [ -f "$scoop_jq" ] && echo "$scoop_jq" && return
-  fi
+# ---- model name --------------------------------------------------------------
+_model_type="$(echo "$input" | jq -r '.model | type' 2>/dev/null)"
+if [[ "$_model_type" == "object" ]]; then
+    model_name="$(jqr '.model.display_name // .model.name // .model.id // "Claude"')"
+else
+    model_name="$(jqr '.model // "Claude"')"
+fi
 
-  echo ""
+case "$model_name" in
+    claude-opus-4-8*|claude-opus-4.8*) model_name="Claude Opus 4.8" ;;
+    claude-opus-4*)                     model_name="Claude Opus 4" ;;
+    claude-opus*)                       model_name="Claude Opus" ;;
+    claude-sonnet-4-6*|claude-sonnet-4.6*) model_name="Claude Sonnet 4.6" ;;
+    claude-sonnet-4*)                   model_name="Claude Sonnet 4" ;;
+    claude-sonnet*)                     model_name="Claude Sonnet" ;;
+    claude-haiku-4-5*|claude-haiku-4.5*) model_name="Claude Haiku 4.5" ;;
+    claude-haiku-4*)                    model_name="Claude Haiku 4" ;;
+    claude-haiku*)                      model_name="Claude Haiku" ;;
+    claude-fable-5*)                    model_name="Claude Fable 5" ;;
+    opus)   model_name="Claude Opus" ;;
+    sonnet) model_name="Claude Sonnet" ;;
+    haiku)  model_name="Claude Haiku" ;;
+esac
+
+session_id="$(jqr '.session_id // empty')"
+transcript_path="$(jqr '.transcript_path // empty')"
+current_dir="$(jqr '.cwd // .workspace.current_dir // empty')"
+exceeds_200k="$(jqr '.exceeds_200k_tokens // false')"
+[[ -z "$current_dir" ]] && current_dir="$(pwd)"
+
+# ---- effort ------------------------------------------------------------------
+effort="$(jqr '.effort.level // .effort // empty')"
+if [[ -z "$effort" ]]; then
+    settings_file="$HOME/.claude/settings.json"
+    [[ -f "$settings_file" ]] && effort="$(jq -r '.effortLevel // empty' "$settings_file" 2>/dev/null)"
+fi
+[[ -n "$effort" ]] && effort="$(echo "${effort:0:1}" | tr '[:lower:]' '[:upper:]')${effort:1}"
+
+model_display="${model_name#Claude }"
+
+# ---- context window (Claude.ai is always 200K for Pro/Max) ------------------
+if [[ "$exceeds_200k" == "true" ]]; then
+    context_limit=1000000
+else
+    context_limit=200000
+fi
+
+fmt_tokens() {
+    local n="$1"
+    if (( n >= 1000000 )); then
+        if (( n % 1000000 == 0 )); then echo "$((n / 1000000))M"
+        else printf "%.1fM" "$(echo "$n" | awk '{print $1/1000000}')"; fi
+    else
+        echo "$((n / 1000))K"
+    fi
 }
 
-JQ=$(_find_jq)
-if [ -z "$JQ" ]; then
-  printf "statusline.sh: jq not found — install jq and make sure it is on PATH\n"
-  exit 1
+window_label="$(fmt_tokens "$context_limit")"
+
+# ---- used tokens from transcript --------------------------------------------
+used_tokens=0
+if [[ -n "$transcript_path" && -f "$transcript_path" ]]; then
+    used_tokens="$(jq -s '
+        map(select(.message.usage != null) | .message.usage
+            | (.input_tokens // 0)
+              + (.cache_read_input_tokens // 0)
+              + (.cache_creation_input_tokens // 0))
+        | last // 0' "$transcript_path" 2>/dev/null)"
+    [[ -z "$used_tokens" || "$used_tokens" == "null" ]] && used_tokens=0
+fi
+(( used_tokens > context_limit )) && used_tokens=$context_limit
+ctx_pct=$(( used_tokens * 100 / context_limit ))
+used_label="$(fmt_tokens "$used_tokens")"
+
+# ---- Claude.ai usage cache (background refresh if stale) --------------------
+now_ts=$(date +%s)
+cache_age=999999
+if [[ -f "$CACHE_FILE" ]]; then
+    cache_mtime=$(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0)
+    cache_age=$(( now_ts - cache_mtime ))
+fi
+if (( cache_age > 300 )) && [[ -f "$REFRESH_SCRIPT" ]]; then
+    bash "$REFRESH_SCRIPT" >/dev/null 2>&1 &
 fi
 
-# ---------------------------------------------------------------------------
-# Read the JSON payload that Claude Code sends on stdin
-# ---------------------------------------------------------------------------
-input=$(cat)
+# ---- parse usage cache -------------------------------------------------------
+session_pct="-"
+weekly_pct="-"
+session_reset_label=""
+weekly_reset_label=""
 
-# ---------------------------------------------------------------------------
-# Model name
-# ---------------------------------------------------------------------------
-model=$(echo "$input" | "$JQ" -r '.model.display_name // "Claude"')
+pct_color() {  # returns ANSI color code based on utilization number
+    local p="${1%.*}"
+    if   (( p >= 80 )); then echo "31"   # red
+    elif (( p >= 60 )); then echo "33"   # yellow
+    else                     echo "32"   # green
+    fi
+}
 
-# ---------------------------------------------------------------------------
-# Context window
-# ---------------------------------------------------------------------------
-used_pct=$(echo "$input" | "$JQ" -r '.context_window.used_percentage     // empty')
-ctx_size=$(echo "$input" | "$JQ" -r '.context_window.context_window_size  // empty')
-in_tok=$(echo "$input"   | "$JQ" -r '.context_window.total_input_tokens   // empty')
-out_tok=$(echo "$input"  | "$JQ" -r '.context_window.total_output_tokens  // empty')
+countdown() {  # ISO 8601 timestamp -> "Xd Yh", "Xh Ym", or "Xm" countdown string
+    local ts
+    ts=$(date -d "$1" +%s 2>/dev/null) || return
+    local secs=$(( ts - now_ts ))
+    (( secs <= 0 )) && echo "now" && return
+    local d=$(( secs / 86400 ))
+    local h=$(( (secs % 86400) / 3600 ))
+    local m=$(( (secs % 3600) / 60 ))
+    if   (( d > 0 )); then echo "${d}d ${h}h"
+    elif (( h > 0 )); then echo "${h}h ${m}m"
+    else echo "${m}m"; fi
+}
 
-# Format context window size as K  (200000 → "200k")
-ctx_label=""
-if [ -n "$ctx_size" ]; then
-  ctx_label=$(echo "$ctx_size" | awk '{ printf "%dk", $1/1000 }')
-fi
+if [[ -f "$CACHE_FILE" ]]; then
+    raw_session_pct="$(jq -r '.five_hour.utilization // empty' "$CACHE_FILE" 2>/dev/null)"
+    raw_weekly_pct="$(jq -r '.seven_day.utilization // empty' "$CACHE_FILE" 2>/dev/null)"
+    session_resets_at="$(jq -r '.five_hour.resets_at // empty' "$CACHE_FILE" 2>/dev/null)"
+    weekly_resets_at="$(jq -r '.seven_day.resets_at // empty' "$CACHE_FILE" 2>/dev/null)"
 
-# Block-character progress bar (24 chars wide)
-BAR_WIDTH=24
-if [ -n "$used_pct" ]; then
-  bar=$(echo "$used_pct $BAR_WIDTH" | awk '{
-    filled = int(($1/100)*$2 + 0.5)
-    empty  = $2 - filled
-    bar    = ""
-    for (i = 0; i < filled; i++) bar = bar "\xe2\x96\x88"
-    for (i = 0; i < empty;  i++) bar = bar "\xe2\x96\x91"
-    printf "%s", bar
-  }')
-  ctx_str=$(printf "[%s] %.0f%%" "$bar" "$used_pct")
-  [ -n "$ctx_label" ] && ctx_str="$ctx_str/${ctx_label}"
+    [[ -n "$raw_session_pct" ]] && session_pct="${raw_session_pct%.*}%"
+    [[ -n "$raw_weekly_pct"  ]] && weekly_pct="${raw_weekly_pct%.*}%"
+    [[ -n "$session_resets_at" ]] && session_reset_label="$(countdown "$session_resets_at")"
+    [[ -n "$weekly_resets_at"  ]] && weekly_reset_label="$(countdown "$weekly_resets_at")"
+
+    session_color="$(pct_color "${raw_session_pct:-0}")"
+    weekly_color="$(pct_color "${raw_weekly_pct:-0}")"
 else
-  bar=$(awk -v w="$BAR_WIDTH" 'BEGIN { for (i=0;i<w;i++) printf "\xe2\x96\x91"; print "" }')
-  ctx_str="[$bar]"
-  [ -n "$ctx_label" ] && ctx_str="$ctx_str/${ctx_label}"
+    session_color="32"
+    weekly_color="32"
 fi
 
-# ---------------------------------------------------------------------------
-# Transcript path — shared by duration, window counts, and workspace
-# ---------------------------------------------------------------------------
-transcript=$(echo "$input" | "$JQ" -r '.transcript_path // empty')
+# ---- progress bar (current conversation context window) ---------------------
+bar_width=10
+filled=$(( (ctx_pct * bar_width + 50) / 100 ))
+(( filled > bar_width )) && filled=$bar_width
+(( filled < 0 ))          && filled=0
+empty=$(( bar_width - filled ))
 
-# ---------------------------------------------------------------------------
-# Estimated session cost (USD)
-# Default pricing: Claude Sonnet 4 family — $3.00/M input, $15.00/M output.
-# See https://www.anthropic.com/pricing and adjust the two variables below.
-# ---------------------------------------------------------------------------
-PRICE_IN=3.0    # USD per million input tokens
-PRICE_OUT=15.0  # USD per million output tokens
-
-cost_str=""
-if [ -n "$in_tok" ] && [ -n "$out_tok" ]; then
-  cost_str=$(echo "$in_tok $out_tok $PRICE_IN $PRICE_OUT" | awk '{
-    cost = ($1 * $3 + $2 * $4) / 1000000
-    if (cost < 0.01) printf "~$0.00"
-    else             printf "~$%.2f", cost
-  }')
+if   (( ctx_pct >= 80 )); then bar_color="31"
+elif (( ctx_pct >= 60 )); then bar_color="33"
+else                           bar_color="32"
 fi
 
-# ---------------------------------------------------------------------------
-# Session duration
-# Reads the ISO 8601 timestamp from the first line of the session's JSONL
-# transcript file — this is the true session start regardless of how many
-# other transcript files exist in the project directory.
-# ---------------------------------------------------------------------------
-duration_str=""
-if [ -n "$transcript" ] && [ -f "$transcript" ]; then
-  first_line=$(head -1 "$transcript" 2>/dev/null)
-  start_iso=$(echo "$first_line" | "$JQ" -r '.timestamp // empty' 2>/dev/null)
-  now=$(date +%s 2>/dev/null)
-  if [ -n "$start_iso" ] && [ -n "$now" ]; then
-    # date -d supports ISO 8601 on Linux and Git Bash on Windows.
-    # macOS users: install GNU coreutils (brew install coreutils) and replace
-    # date with gdate throughout this script.
-    start_epoch=$(date -d "$start_iso" +%s 2>/dev/null)
-    if [ -n "$start_epoch" ]; then
-      elapsed=$(( now - start_epoch ))
-      [ "$elapsed" -lt 0 ] && elapsed=0
-      h=$(( elapsed / 3600 ))
-      m=$(( (elapsed % 3600) / 60 ))
-      s=$(( elapsed % 60 ))
-      if [ "$h" -gt 0 ]; then
-        duration_str=$(printf "%dh%02dm" "$h" "$m")
-      else
-        duration_str=$(printf "%dm%02ds" "$m" "$s")
-      fi
-    fi
-  fi
+bar=""
+for (( i = 0; i < filled; i++ )); do bar="${bar}█"; done
+for (( i = 0; i < empty;  i++ )); do bar="${bar}░"; done
+
+# ---- other segments ----------------------------------------------------------
+session_short="${session_id:0:8}"
+[[ -z "$session_short" ]] && session_short="-"
+folder="$(basename "$current_dir")"
+
+# ---- model color -------------------------------------------------------------
+case "$model_name" in
+    *[Oo]pus*)   model_color="35" ;;
+    *[Ss]onnet*) model_color="34" ;;
+    *[Hh]aiku*)  model_color="32" ;;
+    *)           model_color="36" ;;
+esac
+
+model_segment="$model_display"
+[[ -n "$effort" ]] && model_segment="$model_display [$effort]"
+
+# ---- render ------------------------------------------------------------------
+SEP="\033[90m|\033[0m"
+
+# Context bar segment
+ctx_seg="\033[${bar_color}m${bar}\033[0m \033[${bar_color}m${ctx_pct}%\033[0m \033[90m${used_label}/${window_label}\033[0m"
+
+# 5h usage segment
+if [[ "$session_pct" != "-" ]]; then
+    fiveh_seg="\033[90m5h:\033[0m\033[${session_color}m${session_pct}\033[0m"
+    [[ -n "$session_reset_label" ]] && fiveh_seg="${fiveh_seg} \033[90m↺\033[0m \033[33m${session_reset_label}\033[0m"
+else
+    fiveh_seg="\033[90m5h:-\033[0m"
 fi
 
-# ---------------------------------------------------------------------------
-# 5-hour and 7-day usage windows
-#
-# Counts the number of prompts you personally sent (type=user, parentUuid=null)
-# across ALL your Claude Code projects in the last 5 hours and 7 days.
-# Subagent transcripts are excluded so only your direct messages are counted.
-#
-# This mirrors Claude Pro's rolling 5-hour usage window and gives a 7-day
-# view of your overall activity — all read from local transcript files.
-# ---------------------------------------------------------------------------
-window_5h=""
-window_7d=""
-if [ -n "$transcript" ]; then
-  # Navigate up two levels: session.jsonl → project-dir → projects-root
-  projects_root=$(dirname "$(dirname "$transcript")")
-  now_epoch=$(date +%s 2>/dev/null)
-
-  if [ -n "$now_epoch" ] && [ -d "$projects_root" ]; then
-    # Compute ISO 8601 cutoff timestamps (UTC) for string comparison
-    five_h_cutoff=$(date -d "@$(( now_epoch - 18000 ))"  -u "+%Y-%m-%dT%H:%M:%S" 2>/dev/null)
-    seven_d_cutoff=$(date -d "@$(( now_epoch - 604800 ))" -u "+%Y-%m-%dT%H:%M:%S" 2>/dev/null)
-
-    if [ -n "$five_h_cutoff" ] && [ -n "$seven_d_cutoff" ]; then
-      # Scan all non-subagent JSONL files modified in the last 7 days.
-      # Each matching line is a direct user prompt (parentUuid:null = root turn,
-      # not a tool-result relay). Timestamps are ISO 8601 UTC and sort
-      # lexicographically, so >= string comparison gives the correct cutoff.
-      raw_counts=$(find "$projects_root" -name "*.jsonl" \
-        -not -path "*/subagents/*" -mtime -7 \
-        -exec awk \
-          -v h5="$five_h_cutoff" \
-          -v d7="$seven_d_cutoff" \
-          'BEGIN { c5=0; c7=0 }
-           /\"type\":\"user\"/ && /\"parentUuid\":null/ {
-             if (match($0, /"timestamp":"[^"]*/)) {
-               ts = substr($0, RSTART + 13, 19)
-               if (ts >= h5) c5++
-               if (ts >= d7) c7++
-             }
-           }
-           END { print c5, c7 }' \
-        {} + 2>/dev/null | \
-        awk 'BEGIN{c5=0;c7=0} {c5+=$1; c7+=$2} END{print c5, c7}')
-
-      window_5h=$(echo "${raw_counts:-0 0}" | awk '{print $1}')
-      window_7d=$(echo "${raw_counts:-0 0}" | awk '{print $2}')
-    fi
-  fi
+# 7d usage segment
+if [[ "$weekly_pct" != "-" ]]; then
+    weekly_seg="\033[90m7d:\033[0m\033[${weekly_color}m${weekly_pct}\033[0m"
+    [[ -n "$weekly_reset_label" ]] && weekly_seg="${weekly_seg} \033[90m↺\033[0m \033[33m${weekly_reset_label}\033[0m"
+else
+    weekly_seg="\033[90m7d:-\033[0m"
 fi
 
-# ---------------------------------------------------------------------------
-# Current workspace
-# Extracted from the cwd field of the first user message in the transcript.
-# Displays only the last path component (e.g. "F:\GitHub\Nimbus" → "Nimbus").
-# ---------------------------------------------------------------------------
-workspace=""
-if [ -n "$transcript" ] && [ -f "$transcript" ]; then
-  cwd_raw=$(grep -m1 '"type":"user"' "$transcript" 2>/dev/null | \
-    "$JQ" -r '.cwd // empty' 2>/dev/null)
-  if [ -n "$cwd_raw" ]; then
-    # Split on / or \ and take the last non-empty component
-    workspace=$(printf '%s' "$cwd_raw" | awk -F'[/\\\\]' '{
-      for (i=NF; i>=1; i--) {
-        if ($i != "") { print $i; exit }
-      }
-    }')
-  fi
-fi
-
-# ---------------------------------------------------------------------------
-# Assemble and print the final status line
-# Format:  Model  [████░░░░] 33%/200k  5h:12  7d:45  ~$0.04  12m30s  Workspace
-# ---------------------------------------------------------------------------
-line="$model  $ctx_str"
-[ -n "$window_5h"    ] && line="$line  5h:${window_5h}"
-[ -n "$window_7d"    ] && line="$line  7d:${window_7d}"
-[ -n "$cost_str"     ] && line="$line  $cost_str"
-[ -n "$duration_str" ] && line="$line  $duration_str"
-[ -n "$workspace"    ] && line="$line  $workspace"
-
-printf "%s\n" "$line"
+printf "\033[1;%sm%s\033[0m $SEP %b $SEP %b $SEP %b $SEP \033[90m%s\033[0m $SEP \033[34m%s\033[0m\n" \
+    "$model_color" "$model_segment" \
+    "$ctx_seg" \
+    "$fiveh_seg" \
+    "$weekly_seg" \
+    "$session_short" \
+    "$folder"
