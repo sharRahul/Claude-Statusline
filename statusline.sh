@@ -166,6 +166,8 @@ if [[ -f "$STATUS_CACHE" ]]; then
     status_age=$(( now_ts - _smtime ))
 fi
 if (( status_age > 600 )); then
+    _slmtime=$(stat -c %Y "$STATUS_LOCK" 2>/dev/null || echo 0)
+    (( now_ts - _slmtime > 60 )) && rmdir "$STATUS_LOCK" 2>/dev/null
     if mkdir "$STATUS_LOCK" 2>/dev/null; then
         ( curl -sf --max-time 3 "https://status.claude.com/api/v2/status.json" \
             > "$STATUS_CACHE" 2>/dev/null; rmdir "$STATUS_LOCK" 2>/dev/null ) &
@@ -238,6 +240,8 @@ if [[ -f "$CACHE_FILE" ]]; then
     cache_age=$(( now_ts - _cmtime ))
 fi
 if (( cache_age > 300 )); then
+    _clmtime=$(stat -c %Y "$CACHE_LOCK" 2>/dev/null || echo 0)
+    (( now_ts - _clmtime > 60 )) && rmdir "$CACHE_LOCK" 2>/dev/null
     if mkdir "$CACHE_LOCK" 2>/dev/null; then
         if [[ -f "$REFRESH_SCRIPT" ]]; then
             ( bash "$REFRESH_SCRIPT" >/dev/null 2>&1 || _oauth_refresh_usage; rmdir "$CACHE_LOCK" 2>/dev/null ) &
